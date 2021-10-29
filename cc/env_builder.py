@@ -116,22 +116,17 @@ class Environment(VerboseObjectABC):
         self.observation_space.high = high
         self.observation_space.low = low
 
+        # Reward configuration
+        self.reward_configuration.step = epk.modelpackage.taxonomy.reward_step
+        self.reward_configuration.error = epk.modelpackage.taxonomy.reward_error
+        self.reward_configuration.l2_norm = epk.modelpackage.taxonomy.reward_l2_norm
+
         # Assign
         self.experiment = epk
 
-        # TODO: NO, Playhead should return RAW VALUES... need an self.experiment._build_shards_unprocessed()... !
-        # Build transformed data if needed; run the Pipeline
-        epk._process_batch(pipeline=epk.lpp.experiment.pipeline)
-        epk._inventory_sequences(epk.lpp, transformed=True)
-        # epk.sequence_directory.shuffle(split='all')
-        epk.sequence_directory.split(1.0, 0.0, 0.0)
-        self.experiment._build_shards_processed()
-
         # Initialize Playhead
+        self.experiment._prep_sequences()   # Builds shards using raw (not transformed) data
         self.playhead.initialize(self.experiment)
-
-        # TODO: Build un-nudged responses?
-        #  See: epk._build_unnudged_responses() and finish it
 
         # Safety check.
         # Environment uses Numpy, but need to ensure signal order matches LPP predictions.
@@ -161,6 +156,9 @@ class Environment(VerboseObjectABC):
         # In that case, the trajectory may terminate very quickly.
         # On average, this should not have a major impact...
         feature_df = self.playhead.random()
+
+        # Transform
+        feature_df = self.experiment.lpp.experiment.pipeline.run(feature_df)
 
         # Predict the output sequence without any nudges
         pred_outputs = self.experiment.lpp.run(
@@ -206,20 +204,22 @@ class Environment(VerboseObjectABC):
             - 'pred_nudged_outputs': Predicted outputs with nudges applied to controllable inputs
         """
 
-        # TODO: Scale and translate action.
-        #  self.current_action = self.current_action * self.action_space.scale) + self.action_space.translate
-
         feature_df = self.playhead.next(n)
-        ctrl_inputs, unctrl_inputs, obs_outputs = self._decompose_feature_df(feature_df)
+        ctrl_inputs = self._get_ctrl_input_df_from_feature_df(feature_df)
         action_df = self._build_action_df(action, ctrl_inputs)
+        # TODO: Change sig. pass feature_df, get ctrl_inputs inside. And action samples should be equal to all feature_df, not just input subseq
+
+        # TODO: Scale and translate action.
+        #  self.current_action = (self.current_action * self.action_space.scale) + self.action_space.translate
 
         # Update dfs with action: ctrl_inputs (for return in state) and feature_df (for feeding lpp model)
         ctrl_inputs.update(action_df)
         feature_df.update(action_df)
+        # TODO: WHY do we not have new vals for RPMS here?? We do, but ONLY for input sub-seq... a PROBLEM.
+        #  What does pipeline expect? what does physics model need? overwrite ALL samples w action?
 
-        # TODO: NO this is not correct. We must re-run the pipeline... new actions... spawn new wavelets etc....
-        #  So do we also need to descale the actions first? unfortunately YES... or, have brain return scaled action (FASTER, need scale factor Brain... via action_space?)
-        #  But also, feature_df from Playhead is already transformed... we need Playhead to return RAW DATA...?!?!
+        # Run pipeline on updated feature_df
+        feature_df = self.experiment.lpp.experiment.pipeline.run(feature_df)
 
         # Predict the output sequence, replacing 'ctrl_inputs' with nudged values (the "action")
         pred_outputs_nudged = self.experiment.lpp.run(
@@ -232,6 +232,7 @@ class Environment(VerboseObjectABC):
         # NOTE:
         # By "state" we mean the time-evolutionary dynamics of the system.
         # Observed dynamics are interpreted as an "encoding" of hidden physical state variables.
+        ctrl_inputs, unctrl_inputs, obs_outputs = self._decompose_feature_df(feature_df)
         state = self._assemble_state(
             ctrl_inputs, unctrl_inputs, obs_outputs, pred_outputs_nudged
         )
@@ -368,7 +369,9 @@ class Environment(VerboseObjectABC):
         return
 
     def _decompose_feature_df(self, feature_df):
-        """Separates feature_df into two dfs: ctrl_inputs and unctrl_inputs."""
+        """Separates feature_df into 3 dfs: ctrl_inputs, unctrl_inputs, and outputs.
+        Assumed feature_df is one sequence from the Playhead; we will harvest in & out sub-seqs from the "end".
+        """
         ss_post = self.experiment.signal_selections.post_pipeline
         t = self.experiment.lpp.experiment.modelpackage.taxonomy
         in_ts = feature_df.index[-(t.input_seq_len + t.output_seq_len): -t.output_seq_len]
@@ -377,6 +380,16 @@ class Environment(VerboseObjectABC):
         unctrl_inputs = feature_df.loc[in_ts, ss_post.unctrl_inputs]
         obs_outputs = feature_df.loc[out_ts, ss_post.outputs]
         return ctrl_inputs, unctrl_inputs, obs_outputs
+
+    def _get_ctrl_input_df_from_feature_df(self, feature_df):
+        """Returns DataFrame with ctrl_input signals.
+        Assumed feature_df is one sequence from the Playhead; we will harvest in & out sub-seqs from the "end".
+        """
+        ss_post = self.experiment.signal_selections.post_pipeline
+        t = self.experiment.lpp.experiment.modelpackage.taxonomy
+        in_ts = feature_df.index[-(t.input_seq_len + t.output_seq_len): -t.output_seq_len]
+        ctrl_inputs = feature_df.loc[in_ts, ss_post.ctrl_inputs]
+        return ctrl_inputs
 
     @staticmethod
     def _validate_epk_registration(epk):
@@ -398,7 +411,7 @@ class Environment(VerboseObjectABC):
         feature_df = self.playhead.current()
         pred_outputs_df = self.experiment.lpp.run(
             feature_df,
-            data_is_transformed=True,
+            data_is_transformed=False,
             descale=False,
             check_prerequisites=False,
         )
@@ -722,7 +735,7 @@ class Playhead(VerboseObjectABC):
         # Ensure we have a shard
         if self.current_shard is None:
             self.shard_server.reset()
-            self.current_shard = self.shard_server.next(processed=True, split=split)
+            self.current_shard = self.shard_server.next(processed=False, split=split)
             if self.current_shard is None:
                 msg = f'Unable to get next shard'
                 raise RuntimeError(msg)

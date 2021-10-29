@@ -27,12 +27,11 @@ BRAIN_MSG_COLOR = 'light_green'
 BRAIN_WARN_COLOR = 'light_red'
 
 
-def ActorNetwork(env, taxonomy, **options):
+def ActorNetwork(env, **options):
     """Builds Actor network.
 
     Arguments:
         env (Environment): An Environment object.
-        taxonomy (CMPTaxonomy): An CEPTaxonomy object.
 
     Keyword Arguments:
         model_tf_name (str): Optional. Name to assign model in TF graph.
@@ -41,6 +40,8 @@ def ActorNetwork(env, taxonomy, **options):
     Returns:
         A Keras model.
     """
+
+    taxonomy = env.experiment.modelpackage.taxonomy
 
     taxonomy.update({
         'ctrl_input_dim': len(env.experiment.signal_selections.post_pipeline.ctrl_inputs),
@@ -139,7 +140,7 @@ def ActorNetwork(env, taxonomy, **options):
     return model
 
 
-def CriticNetwork(env, taxonomy, **options):
+def CriticNetwork(env, **options):
     """Builds Critic network.
 
     Arguments:
@@ -153,6 +154,7 @@ def CriticNetwork(env, taxonomy, **options):
     Returns:
         A Keras model.
     """
+    taxonomy = env.experiment.modelpackage.taxonomy
 
     taxonomy.update({
         'ctrl_input_dim': len(env.experiment.signal_selections.post_pipeline.ctrl_inputs),
@@ -463,7 +465,7 @@ def update_target(model_target, model_ref, rho=0):
 
 class Brain(VerboseObjectABC):
 
-    def __init__(self, env, taxonomy):
+    def __init__(self, env):
         super().__init__(msg_color=BRAIN_MSG_COLOR, warn_color=BRAIN_WARN_COLOR, name='brain')
 
         # Assign action space from Environment
@@ -471,10 +473,10 @@ class Brain(VerboseObjectABC):
 
         # Initialize networks
         self._print_msg(f'Building actor and critic networks')
-        self.actor_network = ActorNetwork(env, taxonomy)
-        self.critic_network = CriticNetwork(env, taxonomy)
-        self.actor_target = ActorNetwork(env, taxonomy)
-        self.critic_target = CriticNetwork(env, taxonomy)
+        self.actor_network = ActorNetwork(env)
+        self.critic_network = CriticNetwork(env)
+        self.actor_target = ActorNetwork(env)
+        self.critic_target = CriticNetwork(env)
 
         # Equalize weights with target networks
         self.actor_target.set_weights(self.actor_network.get_weights())

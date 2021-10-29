@@ -9,7 +9,7 @@ import os
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 
 # import gym
-from tqdm import trange
+# from tqdm import trange
 import matplotlib.pyplot as plt
 import tensorflow as tf
 import numpy as np
@@ -54,38 +54,27 @@ env = Environment()
 
 # Testing: Manually create controls epk and LCP.
 #  Normally we'd have a saved (and fully trained) LCP, and load directly into env. SPOOF it here.
-tgt = r'D:\chris\Documents\Programming\other_peoples_repos\DDPG-tf2-master\DDPG-tf2-master\cc\2021-09-24--191345-UTC--Spartanburg--run-3882.lpp'
+tgt = Path.cwd() / '2021-09-24--191345-UTC--Spartanburg--run-3882.lpp'
 epk = ControlsExperimentPackage()
 epk.load_lpp(tgt, password='Akira2019!')
-# epk.autoconfigure_all(ctrl_inputs='RPM', alarm_percent=0.1)
 epk.autoconfigure_all(ctrl_inputs='RPM', alarm_basis='iqr', alarm_percent=1.0)
 
 # Register epk to environment
 env.register_experiment(epk)
 
-# TODO: add autoconfig
-env.reward_configuration.step = 1
-env.reward_configuration.error = -1
-env.reward_configuration.l2_norm = -0.25
-
 # Read out dims
 action_space_high = env.action_space.high
 
 # Build Brain w/models
-brain = Brain(env, taxonomy)
-# tensorboard = Tensorboard(log_dir=TF_LOG_DIR)
+brain = Brain(env)
 
-# Load weights if available
-# logging.info("Loading weights from %s*, make sure the folder exists", CHECKPOINTS_PATH)
-# brain.load_weights(CHECKPOINTS_PATH)
-
-# Define metrics
+# Define Tensorflow metrics for Tensorboard (optional)
 accumulated_reward = tf.keras.metrics.Sum('reward', dtype=tf.float32)
 actions_squared = tf.keras.metrics.Mean('actions', dtype=tf.float32)
 Q_loss = tf.keras.metrics.Mean('Q_loss', dtype=tf.float32)
 A_loss = tf.keras.metrics.Mean('A_loss', dtype=tf.float32)
 
-# Define working lists to capture episode rewards and average over last few episodes
+# Define working lists to capture episode rewards and averages over last few episodes
 ep_reward_list = []
 avg_reward_list = []
 
@@ -95,10 +84,15 @@ env.set_verbosity(False)
 brain._print_msg(f'Launching training...')
 brain.set_verbosity(False)
 
-# TODO: PRIORITIES: (4) mpk refactor incl baseline model; (5) Gym construction (relocate Brain)
-# TODO: CHECK... are we running pipeline AFTER applying action? NO! but we MUST.... this is gonna slow things WAAAAAY down.... :=(
+# TODO: PRIORITIES:
+#  (3) Refactor env.step() to xform nudged inputs;
+#  (4) Refactor action space to include scale and translate properties; we will map uniform a-space to descaled signal values. What are limits? observed min/max +/- 0.5 sigma?
+#  (5) mpk refactor incl baseline model;
+#  (6) Gym construction (relocate Brain)
 
-# TODO: exploration - keep to minimum - init act as 0-sentered normal with smallish spread - 0 == "avg setpoint" which will be CLOSE
+
+# TODO: Clip in Brain.act()... do it there, or elsewhere?
+# TODO: exploration - keep to minimum - init act as 0-centered normal with smallish spread - 0 == "avg setpoint" which will be CLOSE
 
 
 # Train
@@ -159,13 +153,8 @@ for ep in range(TOTAL_EPISODES):
     fancy_print(f'/ r {round(float(accumulated_reward.result().numpy()), 3)}', fg='light_cerulean')
 
     ep_reward_list.append(accumulated_reward.result().numpy())
-    # Mean of last 40 episodes
     avg_reward = np.mean(ep_reward_list[-AVG_REW_WINDOW:])
     avg_reward_list.append(avg_reward)
-
-    # print the average reward
-    # t.set_postfix(r=avg_reward)
-    # tensorboard(ep, accumulated_reward, actions_squared, Q_loss, A_loss)
 
     # save weights
     if ep % 5 == 0 and SAVE_WEIGHTS:
