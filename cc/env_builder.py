@@ -2,13 +2,12 @@ import pandas as pd
 import numpy as np
 import bisect
 import gc
+from collections import deque
 
-from controls.core.lcp import LivelineControlsPackage
 from controls.core.experiments import ControlsExperimentPackage
+from controls import config
 
-from physics.core.base import VerboseObjectABC, VersionedObjectABC
-from physics.core.lpp import LivelinePhysicsPackage
-from pathlib import Path
+from physics.core.base import VerboseObjectABC
 from physics.utils import misc as misc_physics
 from physics.core import validation
 
@@ -32,27 +31,58 @@ class Environment(VerboseObjectABC):
     """
 
     def __init__(self, nickname=None):
+        """Initializes Environment.
+
+        Arguments:
+            nickname (str): Optional. Nickname.
+
+        Returns:
+            No returns.
+        """
         super().__init__(msg_color=ENV_MSG_COLOR, warn_color=ENV_WARN_COLOR, name='environment builder')
         self.experiment = None
-        self.action_space = Space()
+        self.action_space = Space(name='action space')
+        self.controller_params = None  # A dict of DPControllerParam objects, keyed on ctrl_input signal names
         self.current_shard = None  # A Shard object from the epk.shard_server.
         self.msg = None   # Stores tmp messages that can be used in self._construct_info()
         self.nickname = 'Generic Environment' if nickname is None else nickname
-        self.observation_space = Space()
+        self.observation_space = Space(name='observation space')
         self.playhead = Playhead()
         self.reward_configuration = RewardConfiguration()
         self.state = None  # A tuple with (sample index, ctrl_input values)
+
+        # Set after instantiating Playhead
+        self.control_delay = None
+
+        # History buffers
+        self.state_history = EnvironmentHistory(length=2)
 
         # Hidden class definitions
         self._action_space_item_class = Space
         self._experiment_item_class = ControlsExperimentPackage
         self._observation_space_item_class = Space
+        self._playhead_item_class = Playhead
         self._reward_configuration_item_class = RewardConfiguration
+        self._state_history_item_class = EnvironmentHistory
+
+        # Harvest items from config
+        self.control_delay = config.CONTROL_DELAY
 
         return
 
     def __repr__(self):
         return f'RL environment patterned after Open AI Gym'
+
+    @property
+    def control_delay(self):
+        return self._control_delay
+
+    @control_delay.setter
+    def control_delay(self, samples):
+        # Enforce consistency with Playhead
+        self.playhead.control_delay = samples
+        self._control_delay = samples
+        return
 
     def close(self):
         self.__init__()
@@ -98,23 +128,32 @@ class Environment(VerboseObjectABC):
 
         self._validate_epk_registration(epk)
 
+        # Harvest items from config, if available
+        if self.control_delay is None:
+            self.control_delay = config.CONTROL_DELAY
+
         # Action space: Default values
-        # TODO: Get high/low values using median values +/- ACTION_SIGMA, SCALED, from LPP DataPackage?
-        #  Or... from controller limits as in LCP...? NOTE: ctrl limits are currently +/- infinity...
-        #  Check. if not inf, use. if inf, use median +/- (or min/max?)
-        num_sigs = len(epk.signal_selections.post_pipeline.ctrl_inputs)
-        high = self.action_space.build_values(num_sigs, ACTION_SPACE_HIGH)
-        low = self.action_space.build_values(num_sigs, ACTION_SPACE_LOW)
-        self.action_space.high = high
-        self.action_space.low = low
+        ctrl_inputs = epk.signal_selections.post_pipeline.ctrl_inputs
+        high = self.action_space.build_values(len(ctrl_inputs), ACTION_SPACE_HIGH)
+        low = self.action_space.build_values(len(ctrl_inputs), ACTION_SPACE_LOW)
+        self.action_space.high = high   # For network output, in scaled units
+        self.action_space.low = low     # For network output, in scaled units
 
         # Observation space: Default values
         # NOTE: Values are not important, only the dimensionality
-        num_sigs = len(epk.signal_selections.post_pipeline.outputs)
-        high = self.observation_space.build_values(num_sigs, OBSERVATION_SPACE_HIGH)
-        low = self.observation_space.build_values(num_sigs, OBSERVATION_SPACE_LOW)
+        outputs = epk.signal_selections.post_pipeline.outputs
+        high = self.observation_space.build_values(len(outputs), OBSERVATION_SPACE_HIGH)
+        low = self.observation_space.build_values(len(outputs), OBSERVATION_SPACE_LOW)
         self.observation_space.high = high
         self.observation_space.low = low
+
+        # Convert c param list to dict, keying on signal names
+        c_dict = dict()
+        if isinstance(epk.configuration.controller_parameters, list):
+            for c_param in epk.configuration.controller_parameters:
+                if c_param.signal_name in epk.signal_selections.post_pipeline.ctrl_inputs:
+                    c_dict.update({c_param.signal_name: c_param})
+        self.controller_params = c_dict
 
         # Reward configuration
         self.reward_configuration.step = epk.modelpackage.taxonomy.reward_step
@@ -128,9 +167,13 @@ class Environment(VerboseObjectABC):
         self.experiment._prep_sequences()   # Builds shards using raw (not transformed) data
         self.playhead.initialize(self.experiment)
 
-        # Safety check.
-        # Environment uses Numpy, but need to ensure signal order matches LPP predictions.
+        # Safety checks
+        # (1) Environment uses Numpy not Pandas; ensure signal order matches LPP predictions.
         self._validate_lpp_pred_signal_order_vs_lcp_config()
+        # (2) Ensure we specified the 'control_delay'
+        if self.control_delay is None:
+            msg = f'You must set control_delay before registering a ControlsExperimentPackage to the Environment'
+            raise RuntimeError(msg)
 
         return
 
@@ -147,6 +190,8 @@ class Environment(VerboseObjectABC):
             - 'obs_outputs': Observed outputs
             - 'nudged_outputs': Observed outputs with nudges applied to controllable inputs
         """
+        # Reset state history
+        self.state_history.reset()
 
         # Must return a value within OBSERVATION SPACE.
         # It "restarts" the environment.
@@ -181,13 +226,16 @@ class Environment(VerboseObjectABC):
             ctrl_inputs, unctrl_inputs, obs_outputs, pred_outputs
         )
 
+        # Update state history
+        self.state_history.append(state)
+
         return state
 
     def seed(self):
         # Sets random seeds
         raise NotImplementedError()
 
-    def step(self, action, n=1):
+    def step(self, action, n=None):
         """Takes a step in the environment using an action, and returns a 4-tuple.
 
         The 4-tuple follows the Open AI Gym API, and consists of:
@@ -202,26 +250,44 @@ class Environment(VerboseObjectABC):
             - 'obs_outputs': Observed outputs
             - 'pred_outputs': Predicted outputs without nudges
             - 'pred_nudged_outputs': Predicted outputs with nudges applied to controllable inputs
+
+        Arguments:
+            action (np.ndarray): A Numpy array with one float value for each controllable input signal.
+            n (int, None): Number of "next" samples ahead to get from Playhead.
+                Default is *Environment.control_delay*.
+                WARNING: This will override the default.
+                Not recommended to use this - only for testing.
+                Instead, assign a new value to attribute *Environment.control_delay* prior to calling *step()*.
+
+        Returns:
+            4-tuple with state, reward, done, info.
         """
+        n = self.control_delay if n is None else n
 
+        # Get next step of pre-pipeline features
         feature_df = self.playhead.next(n)
-        ctrl_inputs = self._get_ctrl_input_df_from_feature_df(feature_df)
-        action_df = self._build_action_df(action, ctrl_inputs)
-        # TODO: Change sig. pass feature_df, get ctrl_inputs inside. And action samples should be equal to all feature_df, not just input subseq
 
-        # TODO: Scale and translate action.
-        #  self.current_action = (self.current_action * self.action_space.scale) + self.action_space.translate
+        # Build action 2D DataFrame from 1D Numpy, constrain w controller param limits, & scale.
+        # Here we constrain based on physical feature of the plant environment.
+        # Cf. the clip in Brain.act(), where we clip to constrain raw output from actor network to [-1, 1] range.
+
+        action_df = self._build_action_df(action, feature_df)
+        action_df = self._constrain_action(action_df)
+
+        # TODO: Do descale on a df w/only 1 sample?   and REMOVE action_space.scale/translate & assoc methods
+        #  YES IF LAST OP IS MINMAX [-1, 1].  --> MOVE UP, require minmax (DONE).
+
+        action_df = self.experiment.lpp.experiment.pipeline.descale(action_df)
 
         # Update dfs with action: ctrl_inputs (for return in state) and feature_df (for feeding lpp model)
-        ctrl_inputs.update(action_df)
         feature_df.update(action_df)
-        # TODO: WHY do we not have new vals for RPMS here?? We do, but ONLY for input sub-seq... a PROBLEM.
-        #  What does pipeline expect? what does physics model need? overwrite ALL samples w action?
 
-        # Run pipeline on updated feature_df
-        feature_df = self.experiment.lpp.experiment.pipeline.run(feature_df)
+        # Run pipeline on updated 'feature_df' and transform it;
+        # Do it here instead of `lpp.run()` so we have access to xformed features; want to store in state
+        feature_df = self.experiment.lpp.experiment.pipeline.run(feature_df, disable_multiprocessing=False)
 
-        # Predict the output sequence, replacing 'ctrl_inputs' with nudged values (the "action")
+        # Predict the output sequence, replacing 'ctrl_inputs' with nudged values (the "action").
+        # lpp.run() will handle extraction of the physics input sequence from 'features_df'.
         pred_outputs_nudged = self.experiment.lpp.run(
             feature_df,
             data_is_transformed=True,
@@ -240,6 +306,9 @@ class Environment(VerboseObjectABC):
         reward = self._compute_reward(state, action)
         done = self._compute_done(state, action)
         info = self._compute_info(state, action)
+
+        # Store state history; Note this contains "action history" in state['ctrl_inputs'].
+        self.state_history.append(state)
 
         return state, reward, done, info
 
@@ -323,41 +392,141 @@ class Environment(VerboseObjectABC):
         self.msg = None
         return final_msg
 
-    @staticmethod
-    def _build_action_df(action, ctrl_inputs_df):
+    def _constrain_action(self, action_df):
+        """Constrains action based on controller parameter limits. Similar to lcp._constrain_policy().
+
+        Arguments:
+            action_df (pd.DataFrame): A DataFrame with index=samples, columns=ctrl_input signals.
+                In SCALED units.
+
+        Returns:
+            action_df
+        """
+        # Copy incoming raw policy; we will modify it below
+        constrained_policy = action_df.copy()
+
+        # Working signal-wise, apply the constraints
+        for signal_name in action_df.columns.to_list():
+            if signal_name in self.controller_params:
+
+                # Working with SCALED VALUES
+                limits_scaled = self.controller_params[signal_name].limits_scaled
+
+                # Get current state & build df
+                curr_state = self.state_history.history[-1]
+                curr_action = curr_state['observed_ctrl_inputs'].squeeze()
+                current_raw_ctrl_input = self._build_action_df(curr_action, action_df)
+
+                # Get last state & build df
+                try:
+                    last_state = self.state_history.history[-2]
+                    last_action = last_state['observed_ctrl_inputs'].squeeze()
+                    last_raw_ctrl_input = self._build_action_df(last_action, action_df)
+                except IndexError:
+                    last_raw_ctrl_input = None
+
+                # Does "last" information exist? Only if we have taken more than 1 step in environment.
+                last_exists = False if last_raw_ctrl_input is None else True
+
+                # ================================================================
+                # (1) Process nudge limits
+                # ================================================================
+
+                # Get floats for comparison
+                cp = constrained_policy[signal_name][0]
+                ci = current_raw_ctrl_input[signal_name][-1]  # Use LAST value in seq; the current value in meatspace
+                current_nudge = cp - ci
+
+                if current_nudge > limits_scaled.nudge_lim_max:
+                    overage = current_nudge - limits_scaled.nudge_lim_max
+                    constrained_policy[signal_name] = cp - overage
+
+                if current_nudge < limits_scaled.nudge_lim_min:
+                    underage = limits_scaled.output_lim_min - current_nudge
+                    constrained_policy[signal_name] = cp + underage
+
+                # ================================================================
+                # (2) Process "controller output" delta min/max
+                # ================================================================
+
+                if last_exists:
+
+                    # Get floats for comparison; Note that 'constrained_policy' may have been modified above
+                    cp = constrained_policy[signal_name][0]
+                    li = last_raw_ctrl_input[signal_name][0]
+                    output_delta = cp - li
+
+                    if output_delta > limits_scaled.output_delta_max:
+                        overage = output_delta - limits_scaled.output_delta_max
+                        constrained_policy[signal_name] = cp - overage
+
+                    if output_delta < limits_scaled.output_delta_min:
+                        underage = limits_scaled.output_delta_min - output_delta
+                        constrained_policy[signal_name] = cp + underage
+
+                # ================================================================
+                # (3) Process "controller output" limit min/max
+                # ================================================================
+
+                # A simple clip
+                constrained_policy[signal_name].clip(
+                    lower=limits_scaled.output_lim_min,
+                    upper=limits_scaled.output_lim_max,
+                    inplace=True
+                )
+
+        return constrained_policy
+
+    def _build_action_df(self, action, feature_df):
         """Converts action to a DataFrame.
 
          The resulting DataFrame will have:
             - Columns = Controllable input signal names
             - Data = Constant action value for each signal
-            - Index = Pandas Datetime as per *ctrl_inputs_df*
+            - Index = Pandas Datetime as per *feature_df*
 
         Arguments:
-            action (object): A Pandas DataFrame or array-like object.
+            action (np.ndarray): A Pandas DataFrame or array-like object.
               Should have outer dimension = number of controllable input signals.
-              If inner dimension is less than *input_seq_len*, the index from *ctrl_inputs_df* will be used.
-            ctrl_inputs_df (pd.DataFrame): A Pandas DataFrame with controllable input signal data.
-              Dimension should be: *(input_seq_len, number of controllable input signals)*.
-         """
+              If inner dimension is less than *feature_df*, the index from *feature_df* will be used.
+            feature_df (pd.DataFrame): A Pandas DataFrame with controllable input signal data.
+              Dimension should be: *(input_seq_len + output_seq_len + lookback, number of pre-pipeline signals)*.
 
-        action_seq = None
+        Returns:
+            action_df or None.
+         """
+        # Trivial case
+        if action is None:
+            return None
+
+        # Just use first row of action if it's a 2D array; all actions are constant
+        # NOTE: FUTURE: This constant-action assumption may be modified.
+        if action.ndim == 2:
+            action = action[0, :]
+
+        # Init
+        action_df = None
+
+        # Get 'ctrl_inputs' from 'feature_df'
+        ctrl_input_df = self._get_ctrl_input_df_from_feature_df(feature_df)
 
         if isinstance(action, pd.DataFrame):
-            if action.shape == ctrl_inputs_df.shape:
-                if set(action.columns.tolist()) == set(ctrl_inputs_df.columns.tolist()):
+            if action.shape == ctrl_input_df.shape:
+                if set(action.columns.tolist()) == set(ctrl_input_df.columns.tolist()):
                     # Force index to match
-                    action.index = ctrl_inputs_df.index
-                    action_seq = action
+                    action.index = ctrl_input_df.index
+                    action_df = action
+                    # 'action_df' will still be None if we don't make it to this point
 
-        if action_seq is None:
-            data = ctrl_inputs_df.copy().values
-            columns = ctrl_inputs_df.columns
-            index = ctrl_inputs_df.index
+        if action_df is None:
+            data = ctrl_input_df.to_numpy()
+            columns = ctrl_input_df.columns
+            index = ctrl_input_df.index
             for i, c in enumerate(columns):
                 data[:, i] = action[i]
-            action_seq = pd.DataFrame(data=data, columns=columns, index=index)
+            action_df = pd.DataFrame(data=data, columns=columns, index=index)
 
-        return action_seq
+        return action_df
 
     def _build_unnudged_responses(self):
         """Builds TFRecords using un-nudged responses.
@@ -365,7 +534,7 @@ class Environment(VerboseObjectABC):
         Can be used to accelerate RL training by pre-computing these responses in batch mode.
         """
         # noinspection PyProtectedMember
-        self.lcp.experiment._build_unnudged_responses()
+        self.experiment._build_unnudged_responses()
         return
 
     def _decompose_feature_df(self, feature_df):
@@ -386,9 +555,16 @@ class Environment(VerboseObjectABC):
         Assumed feature_df is one sequence from the Playhead; we will harvest in & out sub-seqs from the "end".
         """
         ss_post = self.experiment.signal_selections.post_pipeline
-        t = self.experiment.lpp.experiment.modelpackage.taxonomy
-        in_ts = feature_df.index[-(t.input_seq_len + t.output_seq_len): -t.output_seq_len]
-        ctrl_inputs = feature_df.loc[in_ts, ss_post.ctrl_inputs]
+
+        # To harvest input sub-seqs from the "end" of feature_df:
+        # t = self.experiment.lpp.experiment.modelpackage.taxonomy
+        # in_ts = feature_df.index[-(t.input_seq_len + t.output_seq_len): -t.output_seq_len]
+        # ctrl_inputs = feature_df.loc[in_ts, ss_post.ctrl_inputs]
+
+        # But we will run Pipeline on a full-length feature sequence, including
+        # "warmup" samples for windowed operations, so get the entire sequence:
+        ctrl_inputs = feature_df.loc[:, ss_post.ctrl_inputs]
+
         return ctrl_inputs
 
     @staticmethod
@@ -436,12 +612,38 @@ class Environment(VerboseObjectABC):
         return
 
 
+class EnvironmentHistory(VerboseObjectABC):
+
+    def __init__(self, name='space', length=2):
+        super().__init__(msg_color='yellow', warn_color='red', name=name)
+        self.history = None
+        self.length = length
+
+    def append(self, element):
+        """Appends a single element to the history, and drops an older element if length exceeds limit."""
+        if self.history is None:
+            self.history = deque(maxlen=self.length)
+        self.history.append(element)
+        return
+
+    def extend(self, iterable):
+        """Extends an iterable of elements to the history, and drops older elements if length exceeds limit."""
+        if self.history is None:
+            self.history = deque(maxlen=self.length)
+        self.history.extend(iterable)
+        return
+
+    def reset(self):
+        """Resets the history, clearing all items."""
+        self.__init__(name=self._name, length=self.length)
+
+
 class Space(VerboseObjectABC):
 
-    def __init__(self):
-        super().__init__(msg_color='yellow', warn_color='red', name='action space')
-        self.high = None
-        self.low = None
+    def __init__(self, name='space'):
+        super().__init__(msg_color='yellow', warn_color='red', name=name)
+        self.high = None   # Action space limits
+        self.low = None    # Action space limits
 
     def __repr__(self):
         n_high, n_low = None, None
@@ -613,11 +815,10 @@ class Space(VerboseObjectABC):
 
         return
 
-# TODO: Default action limits should be +/- 3 sigma, scaled?
-
 
 class Playhead(VerboseObjectABC):
 
+    control_delay = validation.ValidateNumber(minvalue=1, allow_none=True)
     current_index = validation.ValidateNumber(minvalue=0, allow_none=True)
     directory = validation.ValidateDict(allow_none=True)
     index_low = validation.ValidateNumber(minvalue=0, allow_none=True)
@@ -625,6 +826,7 @@ class Playhead(VerboseObjectABC):
 
     def __init__(self):
         super().__init__(msg_color='yellow', warn_color='red', name='playhead')
+        self.control_delay = None
         self.current_index = None
         self.current_shard = None   # A Shard object
         self.directory = None
@@ -640,17 +842,18 @@ class Playhead(VerboseObjectABC):
         self._swap_shard()
         return self.current_shard.seq_dfs[self.current_index]
 
-    def goto(self, n):
+    def goto(self, n=None):
         """Returns the sequence with nth index.
 
         Wraps around to first sequence if all sequences exhausted.
 
         Arguments:
-            n (int): Index of desired sequence.
+            n (int, None): Index of desired sequence. Default is Playhead.control_delay.
 
         Returns:
             A Sequence object.
         """
+        n = self._parse_n(n)
         self.current_index = self._wrap(n)
         return self.current()
 
@@ -701,17 +904,18 @@ class Playhead(VerboseObjectABC):
 
         return
 
-    def next(self, n=1):
+    def next(self, n=None):
         """Returns the sequence on the nth index after current sequence index.
 
         Wraps around to first sequence if all sequences exhausted.
 
         Arguments:
-            n (int): Number of sequence indices to increment.
+            n (int, None): Number of sequence indices to increment.
 
         Returns:
             A Sequence object.
         """
+        n = self._parse_n(n)
         self.current_index = self._wrap(self.current_index + n)
         return self.current()
 
@@ -721,6 +925,14 @@ class Playhead(VerboseObjectABC):
         # `np.random.randint()` is INCLUSIVE of interval start, EXCLUSIVE of interval end.
         self.current_index = np.random.randint(low=self.index_low, high=self.index_high)
         return self.current()
+
+    def _parse_n(self, n):
+        """Returns n (control_delay) if n is not None, otherwise self.control_delay."""
+        n = self.control_delay if n is None else n
+        if n is None:
+            msg = f'control_delay attribute has not been set for Playhead'
+            raise RuntimeError(msg)
+        return n
 
     def _swap_shard(self):
         """Offloads current shard and onboards necessary shard according to targeted sequence index."""

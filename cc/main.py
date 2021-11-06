@@ -8,71 +8,58 @@ import random
 import os
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 
+from controls import rl  # <--- want to set a seed for repeatability
+from controls.core.experiments import ControlsExperimentPackage
+
 # import gym
 # from tqdm import trange
 import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
 import tensorflow as tf
 import numpy as np
 from pathlib import Path
 
 from utils import Tensorboard
 from common_definitions import CHECKPOINTS_PATH, TOTAL_EPISODES, TF_LOG_DIR, UNBALANCE_P, MAX_TRAJECTORY_LEN
+from common_definitions import RENDER_ENV, LEARN, USE_NOISE, SAVE_WEIGHTS, EPS_GREEDY, AVG_REW_WINDOW, DTYPE, WARM_UP
 from model import Brain
 from env_builder import Environment
-from controls.core.experiments import ControlsExperimentPackage
-from controls.core.models import CMPTaxonomy
-from fun import fancy_print
+from fun import fancy_print, viz
 
-# Convert DTYPE to Tensorflow dtype
-DTYPE = 'float32'
-TF_DTYPE = tf.dtypes.as_dtype(DTYPE)   # We cast tensors as we construct training examples
-
-taxonomy = CMPTaxonomy()
-taxonomy.nudge_mode = 'absolute'
-required_config = dict(
-    description='I like models',
-    model_name='demo',
-    model_type=1,
-)
-taxonomy.update(required_config)
-options = {
-    'model_tf_name': 'demo'
-}
-
-
-# RL_TASK = args.env
-RENDER_ENV = False
-LEARN = True
-USE_NOISE = True
-WARM_UP = True
-SAVE_WEIGHTS = True
-EPS_GREEDY = 0.95
-AVG_REW_WINDOW = 40
+rl.smash_old_project_files()
 
 # Create the gym environment
 env = Environment()
 
-# Testing: Manually create controls epk and LCP.
-#  Normally we'd have a saved (and fully trained) LCP, and load directly into env. SPOOF it here.
-tgt = Path.cwd() / '2021-09-24--191345-UTC--Spartanburg--run-3882.lpp'
+# Testing: Manually create controls epk
 epk = ControlsExperimentPackage()
+tgt = r'D:\chris\Documents\Programming\liveline_repos\ll_ml_physics_tf2_beta\physics\assets\sample_data\livonia_run140\livonia_run140_lstm.lpp'
+# tgt = Path.cwd() / '2021-09-24--191345-UTC--Spartanburg--run-3882.lpp'
 epk.load_lpp(tgt, password='Akira2019!')
-epk.autoconfigure_all(ctrl_inputs='RPM', alarm_basis='iqr', alarm_percent=1.0)
+# epk.autoconfigure_all(ctrl_inputs='RPM', alarm_basis='iqr', alarm_decimal=1.0)
+epk.autoconfigure_all(ctrl_inputs='RPM', alarm_basis='iqr', alarm_decimal=1.33)
+# epk.autoconfigure_all(ctrl_inputs='RPM', alarm_basis='iqr', alarm_decimal=1.5)   # <--- Can be TIGHTER than obs outputs during "imitate" phase; will give short trajectories
+
+# # What do ctrl_inputs look like, un-nudged?
+# dpk = epk.datapackages[0]
+# dpk.transform_data(epk.lpp.experiment.pipeline, force_fit=True)
+# dpk.plot_data('transformed')
+
+# TODO: retrain physics examples, update sample_data in physics. remove from controls? redundant
+# TODO: MovingAvg... do we need to enforce a 2x lookback? we are already handling edges...
 
 # Register epk to environment
 env.register_experiment(epk)
-
-# Read out dims
-action_space_high = env.action_space.high
 
 # Build Brain w/models
 brain = Brain(env)
 
 # Define Tensorflow metrics for Tensorboard (optional)
-accumulated_reward = tf.keras.metrics.Sum('reward', dtype=tf.float32)
-actions_squared = tf.keras.metrics.Mean('actions', dtype=tf.float32)
-Q_loss = tf.keras.metrics.Mean('Q_loss', dtype=tf.float32)
-A_loss = tf.keras.metrics.Mean('A_loss', dtype=tf.float32)
+TF_DTYPE = tf.dtypes.as_dtype(DTYPE)   # We cast tensors as we construct training examples
+accumulated_reward = tf.keras.metrics.Sum('reward', dtype=TF_DTYPE)
+actions_squared = tf.keras.metrics.Mean('actions', dtype=TF_DTYPE)
+Q_loss = tf.keras.metrics.Mean('Q_loss', dtype=TF_DTYPE)
+A_loss = tf.keras.metrics.Mean('A_loss', dtype=TF_DTYPE)
 
 # Define working lists to capture episode rewards and averages over last few episodes
 ep_reward_list = []
@@ -80,25 +67,21 @@ avg_reward_list = []
 
 # Optional: Messages
 env.set_verbosity(False)
-# noinspection PyProtectedMember
 brain._print_msg(f'Launching training...')
 brain.set_verbosity(False)
 
 # TODO: PRIORITIES:
-#  (3) Refactor env.step() to xform nudged inputs;
-#  (4) Refactor action space to include scale and translate properties; we will map uniform a-space to descaled signal values. What are limits? observed min/max +/- 0.5 sigma?
 #  (5) mpk refactor incl baseline model;
 #  (6) Gym construction (relocate Brain)
+#  (7) track dtype and ensure we're running all tf ops w float32
 
-
-# TODO: Clip in Brain.act()... do it there, or elsewhere?
 # TODO: exploration - keep to minimum - init act as 0-centered normal with smallish spread - 0 == "avg setpoint" which will be CLOSE
-
 
 # Train
 rc = env.reward_configuration
 msg = f'STRUCTURE: STEP {rc.step} / ERROR {rc.error} / L2_NORM {rc.l2_norm}, MAX TRAJ {MAX_TRAJECTORY_LEN}'
 fancy_print(msg, fg='chartreuse', header=True)
+touches = 0
 
 for ep in range(TOTAL_EPISODES):
 
@@ -109,33 +92,44 @@ for ep in range(TOTAL_EPISODES):
     A_loss.reset_states()
     brain.noise.reset()
 
+    imitate = True if ep < 100 else False
+
     msg = f'Episode {ep} from playhead {env.playhead.current_index}:'.ljust(40)
-    color = 'yellow' if ep >= WARM_UP else 'light_red'
+    color = 'yellow' if (ep >= WARM_UP and not imitate) else 'light_red'
     fancy_print(msg, fg=color, end='')
 
     for i in range(MAX_TRAJECTORY_LEN):
-        # TODO: parameterize max trajectory length (currently 2000)
-        #  The other way to "end" a trajectory is if there is no "next seq" available...
 
+        touches += 1
+
+        # Console output
         fancy_print(f'{i} ', fg='light_cerulean', end='')
-
         if RENDER_ENV:  # render the environment into GUI
             env.render()
 
         # Receive state and reward from environment.
         # TODO: Batch these and distribute the computations.
         #  E.g. get 64 actions at once? Compute 64 env steps at once? WHOLE DPK at once...???
+        c1 = ep >= WARM_UP
+        c2 = random.random() < EPS_GREEDY + ((1-EPS_GREEDY) * (ep / TOTAL_EPISODES))
+        random_exploration = not(c1 and c2)
+
+        # TODO: Mesh imitate / random_exploration options. First imitate for n epochs, then explore for m?
+
         cur_act = brain.act(
             state=prev_state,
-            not_random=(ep >= WARM_UP) and (random.random() < EPS_GREEDY+(1-EPS_GREEDY)*ep/TOTAL_EPISODES),
+            random=random_exploration,
             noise=USE_NOISE,
             action_space=env.action_space,
+            imitate=imitate,
+            control_delay=env.control_delay,
         )
         state, reward, done, _ = env.step(cur_act)
         brain.remember(prev_state, reward, state, done)
 
         # Update network weights and capture losses
         if LEARN:
+            # TODO: Is it really OK to "learn" on imitated actions? Actor network did not produce them...
             experience = brain.buffer.get_batch(unbalance_p=UNBALANCE_P)
             c, a = brain.learn(experience)
             Q_loss(c)
@@ -143,7 +137,7 @@ for ep in range(TOTAL_EPISODES):
 
         # Update metrics and prepare for next step
         accumulated_reward(reward)
-        actions_squared(np.square(cur_act/action_space_high))
+        actions_squared(np.square(cur_act/env.action_space.high))
         prev_state = state
 
         if done:
@@ -159,20 +153,21 @@ for ep in range(TOTAL_EPISODES):
     # save weights
     if ep % 5 == 0 and SAVE_WEIGHTS:
         brain.save_weights(CHECKPOINTS_PATH)
-        with open(Path(TF_LOG_DIR) / 'ep_rew.txt', 'w') as f:
+        if not TF_LOG_DIR.exists():
+            Path.mkdir(TF_LOG_DIR, parents=True)
+        with open(TF_LOG_DIR / 'ep_rew.txt', 'w') as f:
             f.write(str(ep_reward_list)[1:-1])
-        with open(Path(TF_LOG_DIR) / 'avg_ep_rew.txt', 'w') as f:
+        with open(TF_LOG_DIR / 'avg_ep_rew.txt', 'w') as f:
             f.write(str(avg_reward_list)[1:-1])
 
-# Plotting graph
-# Episodes versus Avg. Rewards
-plt.plot(avg_reward_list)
-plt.xlabel("Episode")
-plt.ylabel("Avg. Epsiodic Reward")
-c = env.reward_configuration
-plt.title(f'Reward: {c.step} / {c.error} / {c.l2_norm}, Max traj: {MAX_TRAJECTORY_LEN}')
-plt.show()
-
+# Plot episodes versus avg rewards
+r = env.reward_configuration
+viz.line(avg_reward_list,
+         suptitle='AVERAGE EPISODIC REWARD',
+         title=f'step {r.step}   |   error {r.error}   |   l2_norm {r.l2_norm}   |   touches {touches}',
+         ylabel=f'{AVG_REW_WINDOW}-Episode Moving Average',
+         xlabel='Episode')
+# TODO: Add detail to plot. alarm basis & setting (decimal, value, sigma)
 # env.close()
 brain.save_weights(CHECKPOINTS_PATH)
 

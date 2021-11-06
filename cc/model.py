@@ -6,6 +6,7 @@ import os
 
 import numpy as np
 import tensorflow as tf
+from pathlib import Path
 
 from common_definitions import (KERNEL_INITIALIZER, GAMMA, RHO, STD_DEV, BUFFER_SIZE, BATCH_SIZE,
                                 CRITIC_LR, ACTOR_LR)
@@ -497,7 +498,7 @@ class Brain(VerboseObjectABC):
         self.critic_optimizer = tf.keras.optimizers.Adam(CRITIC_LR, amsgrad=True)
         self.actor_optimizer = tf.keras.optimizers.Adam(ACTOR_LR, amsgrad=True)
 
-        # Tmp variable to capture current action
+        # Tmp variable to capture current & last actions
         self.current_action = None
 
         # define update weights with tf.function for improved performance
@@ -524,7 +525,7 @@ class Brain(VerboseObjectABC):
 
         @tf.function(input_signature=[input_signature])
         def update_weights(features):
-            """Function to update model weights."""
+            """Function to update model weights for DDPG."""
 
             state_elems = ('observed_ctrl_inputs', 'observed_unctrl_inputs', 'observed_outputs', 'predicted_outputs')
 
@@ -567,19 +568,23 @@ class Brain(VerboseObjectABC):
         # Assign function to attribute
         self.update_weights = update_weights
 
-    def act(self, state, not_random=True, noise=True, action_space=None):
+    def act(self, state, random=False, noise=True, action_space=None, imitate=False, control_delay=1):
         """Given the state, get an action from the Actor network.
 
         Arguments:
             state (dict): The current state. Contains 4 standard keys.
-            not_random (bool): If True, we use greedy.
-                Default is True.
+            random (bool): If False, we use greedy.
+                Default is False.
             noise (bool): If True, noise is added to the resulting action.
                 This can improve exploration during training.
                 Default is True.
             action_space (Space): Optional. An n-dimensional Space object.
                 If provided, random actions will be drawn from action_space.random().
                 If omitted, random actions will be drawn from a uniform distribution.
+            imitate (bool): If True,
+            control_delay (int): Optional. Expected interval in samples between successive calls to
+                LCP.run() during inference.
+                Default is 1 (no delay)
 
         Returns:
             A Numpy array with one float value for each dimension in action space.
@@ -587,10 +592,13 @@ class Brain(VerboseObjectABC):
         # Optional noise
         n = self.noise() if noise else 0
 
-        if not_random:
-            # Get action from network
-            self.current_action = self.actor_network(state)[0].numpy() + n
-        else:
+        if imitate:
+            # Set 'current_action' equal to "next" 'observed_ctrl_inputs';
+            # this is what the factory "actually did" at this state in real life.
+            self.current_action = state['observed_ctrl_inputs'].squeeze()[control_delay, :]
+            return self.current_action
+
+        if random:
             # Get action from random sample of space
             if action_space is not None:
                 self.current_action = action_space.random() + n
@@ -600,8 +608,14 @@ class Brain(VerboseObjectABC):
                     self.action_space.high,
                     self.action_space.dimensions,
                 ) + n
+        else:
+            # Get action from network
+            self.current_action = self.actor_network(state)[0].numpy() + n
 
-        # TODO: Do not clip here... do after scale/translate?
+        # Clip to ensure we don't violate action space limits.
+        # NOTE: We will also constrain in Environment.step() based on controller param limits from factory.
+        # Here we clip to constrain raw output from actor network to [-1, 1] range.
+        # This is not actually necessary if we are using 'tanh' activation for exposed layer.
         self.current_action = np.clip(self.current_action, self.action_space.low, self.action_space.high)
 
         return self.current_action
@@ -644,28 +658,53 @@ class Brain(VerboseObjectABC):
 
         return critic_loss, actor_loss
 
-    def save_weights(self, path):
-        """
-        Save weights to `path`
-        """
-        parent_dir = os.path.dirname(path)
-        if not os.path.exists(parent_dir):
-            os.makedirs(parent_dir)
-        # Save the weights
-        self.actor_network.save_weights(path + "an.h5")
-        self.critic_network.save_weights(path + "cn.h5")
-        self.critic_target.save_weights(path + "ct.h5")
-        self.actor_target.save_weights(path + "at.h5")
+    def save_weights(self, p):
+        """Saves weights to path.
 
-    def load_weights(self, path):
+        Arguments:
+            p (Path): A path-like object.
+
+        Returns:
+            No returns.
         """
-        Load weights from path
+        if p is not None:
+            p = Path(p)
+        else:
+            self._print_warning(f'No path provided for offloading. Aborting save_weights().')
+            return
+
+        # Handle non-absolute paths
+        if not Path.is_absolute(p):
+            p = Path.home() / p
+            self._print_warning(f'Path for saving weights is not absolute. Creating path in user home directory.')
+
+        # Ensure path is a dir, not a file target
+        p = p.with_suffix('')
+
+        # Make dir
+        if not p.exists():
+            Path.mkdir(p, parents=True)
+
+        # Save the weights
+        self.actor_network.save_weights(p / 'an.h5')
+        self.critic_network.save_weights(p / 'cn.h5')
+        self.critic_target.save_weights(p / 'ct.h5')
+        self.actor_target.save_weights(p / 'at.h5')
+
+    def load_weights(self, p):
+        """Loads weights from path
+
+        Arguments:
+            p (Path): A path-like object.
+
+        Returns:
+            No returns.
         """
         try:
-            self.actor_network.load_weights(path + "an.h5")
-            self.critic_network.load_weights(path + "cn.h5")
-            self.critic_target.load_weights(path + "ct.h5")
-            self.actor_target.load_weights(path + "at.h5")
+            self.actor_network.load_weights(p / "an.h5")
+            self.critic_network.load_weights(p / "cn.h5")
+            self.critic_target.load_weights(p / "ct.h5")
+            self.actor_target.load_weights(p / "at.h5")
         except OSError as err:
             # logging.warning("Weights files cannot be found, %s", err)
             pass
